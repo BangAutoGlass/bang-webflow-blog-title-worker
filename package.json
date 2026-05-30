@@ -1,0 +1,11 @@
+{
+  "name": "bang-webflow-blog-title-worker",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node worker.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
