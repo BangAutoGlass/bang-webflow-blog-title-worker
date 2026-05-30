@@ -1,6 +1,9 @@
 const EDGE_FUNCTION_URL = mustGetEnv("EDGE_FUNCTION_URL")
 const WORKER_SECRET = mustGetEnv("WORKER_SECRET")
-const JOB_ID = mustGetEnv("JOB_ID")
+
+// JOB_ID is now optional.
+// If blank/missing, the Supabase Edge Function will auto-discover the next pending job.
+const JOB_ID = process.env.JOB_ID || ""
 
 const PHASE = process.env.PHASE || "generate"
 // PHASE options:
@@ -23,9 +26,11 @@ const KEEP_ALIVE_WHEN_DONE = boolEnv("KEEP_ALIVE_WHEN_DONE", true)
 
 function mustGetEnv(name) {
   const value = process.env[name]
+
   if (!value || !value.trim()) {
     throw new Error(`Missing required environment variable: ${name}`)
   }
+
   return value.trim()
 }
 
@@ -36,8 +41,10 @@ function numberEnv(name, fallback) {
 
 function boolEnv(name, fallback) {
   const value = String(process.env[name] || "").toLowerCase().trim()
+
   if (["true", "1", "yes", "y"].includes(value)) return true
   if (["false", "0", "no", "n"].includes(value)) return false
+
   return fallback
 }
 
@@ -52,6 +59,7 @@ function getStats(data) {
 
   return {
     totalRows: Number(stats.totalRows || 0),
+    requestedTitleCount: Number(stats.requestedTitleCount || 5),
     expectedFinalTitles: Number(stats.expectedFinalTitles || 0),
     generatedTitleCount: Number(stats.generatedTitleCount || 0),
 
@@ -60,6 +68,8 @@ function getStats(data) {
     generationRunning: Number(generation.running || 0),
     generationSuccess: Number(generation.success || 0),
     generationError: Number(generation.error || 0),
+    generationSkipped: Number(generation.skipped || 0),
+    generationCancelled: Number(generation.cancelled || 0),
 
     webflowNotReady: Number(webflow.notReady || 0),
     webflowReady: Number(webflow.ready || 0),
@@ -68,27 +78,44 @@ function getStats(data) {
     webflowCreated: Number(webflow.created || 0),
     webflowPartialCreated: Number(webflow.partialCreated || 0),
     webflowError: Number(webflow.error || 0),
-    webflowCreatedItemCount: Number(stats.webflowCreatedItemCount || 0)
+    webflowSkipped: Number(webflow.skipped || 0),
+    webflowCancelled: Number(webflow.cancelled || 0),
+
+    webflowCreatedItemCount: Number(stats.webflowCreatedItemCount || 0),
+    webflowResultCount: Number(stats.webflowResultCount || 0),
+    researchCompletedCount: Number(stats.researchCompletedCount || 0),
+    researchErrorCount: Number(stats.researchErrorCount || 0)
   }
 }
 
+function buildRequestBody(action) {
+  const body = {
+    action,
+    workerId: WORKER_ID,
+    workerBatchSize: BATCH_SIZE,
+    workerConcurrency: CONCURRENCY,
+    maxWorkerSeconds: MAX_WORKER_SECONDS,
+    resetStaleMinutes: RESET_STALE_MINUTES,
+    includeRows: false
+  }
+
+  if (JOB_ID && JOB_ID.trim()) {
+    body.jobId = JOB_ID.trim()
+  }
+
+  return body
+}
+
 async function callEdge(action) {
+  const body = buildRequestBody(action)
+
   const response = await fetch(EDGE_FUNCTION_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "x-worker-secret": WORKER_SECRET
     },
-    body: JSON.stringify({
-      action,
-      jobId: JOB_ID,
-      workerId: WORKER_ID,
-      workerBatchSize: BATCH_SIZE,
-      workerConcurrency: CONCURRENCY,
-      maxWorkerSeconds: MAX_WORKER_SECONDS,
-      resetStaleMinutes: RESET_STALE_MINUTES,
-      includeRows: false
-    })
+    body: JSON.stringify(body)
   })
 
   const text = await response.text()
@@ -105,10 +132,6 @@ async function callEdge(action) {
   }
 
   return data
-}
-
-async function getJob() {
-  return await callEdge("get_job")
 }
 
 function generationDone(stats) {
@@ -142,103 +165,158 @@ function logProgress(label, data) {
     time: new Date().toISOString(),
     phase: PHASE,
     label,
-    jobId: JOB_ID,
+    configuredJobId: JOB_ID || null,
+    activeJobId: data.jobId || data?.job?.jobId || null,
+    autoDiscoveryEnabled: !JOB_ID,
+    message: data.message || null,
     processedCount: data.processedCount ?? null,
     claimedTotal: data.claimedTotal ?? null,
+    staleResetCount: data.staleResetCount ?? null,
     totalRows: stats.totalRows,
+    requestedTitleCount: stats.requestedTitleCount,
     generatedTitleCount: stats.generatedTitleCount,
     expectedFinalTitles: stats.expectedFinalTitles,
+    research: {
+      completed: stats.researchCompletedCount,
+      errors: stats.researchErrorCount
+    },
     generation: {
       success: stats.generationSuccess,
       pending: stats.generationPending,
       queued: stats.generationQueued,
       running: stats.generationRunning,
-      error: stats.generationError
+      error: stats.generationError,
+      skipped: stats.generationSkipped,
+      cancelled: stats.generationCancelled
     },
     webflow: {
       createdRows: stats.webflowCreated,
       createdItems: stats.webflowCreatedItemCount,
+      resultCount: stats.webflowResultCount,
+      notReady: stats.webflowNotReady,
       ready: stats.webflowReady,
       queued: stats.webflowQueued,
       creating: stats.webflowCreating,
       partialCreated: stats.webflowPartialCreated,
-      error: stats.webflowError
+      error: stats.webflowError,
+      skipped: stats.webflowSkipped,
+      cancelled: stats.webflowCancelled
     }
   }, null, 2))
 
   return stats
 }
 
+async function runGenerateLoop() {
+  const data = await callEdge("worker_tick")
+  const stats = logProgress("generation_tick_complete", data)
+
+  if (!data.jobId && Number(data.claimedTotal || 0) === 0) {
+    console.log("No pending generation job found. Sleeping before checking again.")
+    await sleep(IDLE_SLEEP_MS)
+    return
+  }
+
+  if (STOP_ON_ERRORS && stats.generationError > 0) {
+    console.error("Generation errors found. Stopping so you can review/reset failed rows.")
+    process.exit(1)
+  }
+
+  if (generationDone(stats)) {
+    console.log("Generation complete for active job. All rows have generated titles.")
+
+    if (KEEP_ALIVE_WHEN_DONE) {
+      await sleep(IDLE_SLEEP_MS)
+      return
+    }
+
+    process.exit(0)
+  }
+
+  const noWorkClaimed = Number(data.claimedTotal || 0) === 0
+
+  if (noWorkClaimed) {
+    await sleep(IDLE_SLEEP_MS)
+  } else {
+    await sleep(SLEEP_MS)
+  }
+}
+
+async function runWebflowLoop() {
+  const data = await callEdge("send_to_webflow")
+  const stats = logProgress("webflow_tick_complete", data)
+
+  if (!data.jobId && Number(data.claimedTotal || 0) === 0) {
+    console.log("No Webflow-ready job found. Sleeping before checking again.")
+    await sleep(IDLE_SLEEP_MS)
+    return
+  }
+
+  if (STOP_ON_ERRORS && (stats.webflowError > 0 || stats.webflowPartialCreated > 0)) {
+    console.error("Webflow errors found. Stopping so you can review/reset failed rows.")
+    process.exit(1)
+  }
+
+  if (webflowDone(stats)) {
+    console.log("Webflow creation complete for active job.")
+
+    if (KEEP_ALIVE_WHEN_DONE) {
+      await sleep(IDLE_SLEEP_MS)
+      return
+    }
+
+    process.exit(0)
+  }
+
+  const noWorkClaimed = Number(data.claimedTotal || 0) === 0
+
+  if (noWorkClaimed) {
+    await sleep(IDLE_SLEEP_MS)
+  } else {
+    await sleep(SLEEP_MS)
+  }
+}
+
 async function main() {
-  console.log(`Starting ${PHASE} worker for job ${JOB_ID}`)
+  console.log(JSON.stringify({
+    time: new Date().toISOString(),
+    event: "worker_starting",
+    phase: PHASE,
+    workerId: WORKER_ID,
+    configuredJobId: JOB_ID || null,
+    autoDiscoveryEnabled: !JOB_ID,
+    batchSize: BATCH_SIZE,
+    concurrency: CONCURRENCY,
+    maxWorkerSeconds: MAX_WORKER_SECONDS,
+    resetStaleMinutes: RESET_STALE_MINUTES,
+    stopOnErrors: STOP_ON_ERRORS,
+    keepAliveWhenDone: KEEP_ALIVE_WHEN_DONE
+  }, null, 2))
+
+  if (!["generate", "webflow"].includes(PHASE)) {
+    throw new Error(`Invalid PHASE: ${PHASE}. Use "generate" or "webflow".`)
+  }
 
   while (true) {
     try {
-      const action = PHASE === "webflow" ? "send_to_webflow" : "worker_tick"
-      const data = await callEdge(action)
-      const stats = logProgress("tick_complete", data)
-
       if (PHASE === "generate") {
-        if (STOP_ON_ERRORS && stats.generationError > 0) {
-          console.error("Generation errors found. Stopping so you can review/reset failed rows.")
-          process.exit(1)
-        }
-
-        if (generationDone(stats)) {
-          console.log("Generation complete. All rows have generated titles.")
-
-          if (KEEP_ALIVE_WHEN_DONE) {
-            await sleep(IDLE_SLEEP_MS)
-            continue
-          }
-
-          process.exit(0)
-        }
-
-        const noWorkClaimed = Number(data.claimedTotal || 0) === 0
-        if (noWorkClaimed) {
-          await sleep(IDLE_SLEEP_MS)
-        } else {
-          await sleep(SLEEP_MS)
-        }
-
+        await runGenerateLoop()
         continue
       }
 
       if (PHASE === "webflow") {
-        if (STOP_ON_ERRORS && (stats.webflowError > 0 || stats.webflowPartialCreated > 0)) {
-          console.error("Webflow errors found. Stopping so you can review/reset failed rows.")
-          process.exit(1)
-        }
-
-        if (webflowDone(stats)) {
-          console.log("Webflow creation complete.")
-
-          if (KEEP_ALIVE_WHEN_DONE) {
-            await sleep(IDLE_SLEEP_MS)
-            continue
-          }
-
-          process.exit(0)
-        }
-
-        const noWorkClaimed = Number(data.claimedTotal || 0) === 0
-        if (noWorkClaimed) {
-          await sleep(IDLE_SLEEP_MS)
-        } else {
-          await sleep(SLEEP_MS)
-        }
-
+        await runWebflowLoop()
         continue
       }
-
-      throw new Error(`Unknown PHASE: ${PHASE}`)
     } catch (error) {
       console.error(JSON.stringify({
         time: new Date().toISOString(),
+        event: "worker_error",
         phase: PHASE,
-        jobId: JOB_ID,
-        error: error.message || String(error)
+        workerId: WORKER_ID,
+        configuredJobId: JOB_ID || null,
+        autoDiscoveryEnabled: !JOB_ID,
+        error: error?.message || String(error)
       }, null, 2))
 
       await sleep(ERROR_SLEEP_MS)
@@ -247,6 +325,11 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(error)
+  console.error(JSON.stringify({
+    time: new Date().toISOString(),
+    event: "fatal_worker_error",
+    error: error?.message || String(error)
+  }, null, 2))
+
   process.exit(1)
 })
