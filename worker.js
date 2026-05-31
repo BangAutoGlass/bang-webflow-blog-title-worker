@@ -54,8 +54,24 @@ const JOB_ID = stringEnv("JOB_ID", "")
 const PHASE = stringEnv("PHASE", "generate").toLowerCase()
 const WORKER_ID = stringEnv("WORKER_ID", `render-${PHASE}-worker`)
 
-const BATCH_SIZE = numberEnv("BATCH_SIZE", PHASE === "webflow" ? 5 : 1, 1, PHASE === "webflow" ? 25 : 10)
-const CONCURRENCY = numberEnv("CONCURRENCY", 1, 1, PHASE === "generate" ? 3 : 5)
+const MAX_GENERATE_BATCH_SIZE = numberEnv("MAX_GENERATE_BATCH_SIZE", 250, 1, 1000)
+const MAX_GENERATE_CONCURRENCY = numberEnv("MAX_GENERATE_CONCURRENCY", 100, 1, 1000)
+const MAX_WEBFLOW_BATCH_SIZE = numberEnv("MAX_WEBFLOW_BATCH_SIZE", 25, 1, 100)
+const MAX_WEBFLOW_CONCURRENCY = numberEnv("MAX_WEBFLOW_CONCURRENCY", 5, 1, 25)
+
+const BATCH_SIZE = numberEnv(
+  "BATCH_SIZE",
+  PHASE === "webflow" ? 5 : 1,
+  1,
+  PHASE === "webflow" ? MAX_WEBFLOW_BATCH_SIZE : MAX_GENERATE_BATCH_SIZE
+)
+
+const CONCURRENCY = numberEnv(
+  "CONCURRENCY",
+  1,
+  1,
+  PHASE === "webflow" ? MAX_WEBFLOW_CONCURRENCY : MAX_GENERATE_CONCURRENCY
+)
 const RESET_STALE_MINUTES = numberEnv("RESET_STALE_MINUTES", 45, 0, 1440)
 
 const SLEEP_MS = numberEnv("SLEEP_MS", 5000, 250, 300000)
@@ -1556,6 +1572,10 @@ async function main() {
     autoDiscoveryEnabled: !JOB_ID,
     batchSize: BATCH_SIZE,
     concurrency: CONCURRENCY,
+    maxGenerateBatchSize: MAX_GENERATE_BATCH_SIZE,
+    maxGenerateConcurrency: MAX_GENERATE_CONCURRENCY,
+    maxWebflowBatchSize: MAX_WEBFLOW_BATCH_SIZE,
+    maxWebflowConcurrency: MAX_WEBFLOW_CONCURRENCY,
     resetStaleMinutes: RESET_STALE_MINUTES,
     stopOnErrors: STOP_ON_ERRORS,
     keepAliveWhenDone: KEEP_ALIVE_WHEN_DONE,
