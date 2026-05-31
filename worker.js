@@ -4,7 +4,9 @@
   Purpose:
   - Keep long-running OpenAI, SERP, and Webflow work out of Supabase Edge Functions.
   - Use Supabase Edge only as a short-lived queue/control API.
-  - Process one CSV row/request at a time by default, generating exactly 5 blog titles per row.
+  - Claim multiple CSV rows from one queued job and run each row as its own OpenAI request.
+  - Default generation behavior is tuned for 25 parallel row-level OpenAI requests.
+  - Webflow creation remains intentionally slower and separately configurable.
 
   Required env for PHASE=generate or PHASE=all:
     EDGE_FUNCTION_URL
@@ -19,16 +21,30 @@
 
   Common env:
     PHASE=generate | webflow | all
-    JOB_ID=optional specific job UUID
+    JOB_ID=optional specific job UUID; leave blank to auto-discover the next queued job
     WORKER_ID=optional worker label
-    BATCH_SIZE=generate defaults 1, webflow defaults 5
-    CONCURRENCY=defaults 1
     RESET_STALE_MINUTES=45
     SLEEP_MS=5000
     IDLE_SLEEP_MS=60000
     ERROR_SLEEP_MS=30000
     STOP_ON_ERRORS=false
     KEEP_ALIVE_WHEN_DONE=true
+
+  Generation concurrency env:
+    GENERATE_BATCH_SIZE=25
+    GENERATE_CONCURRENCY=25
+    MAX_GENERATE_BATCH_SIZE=25
+    MAX_GENERATE_CONCURRENCY=25
+
+  Webflow concurrency env:
+    WEBFLOW_BATCH_SIZE=5
+    WEBFLOW_CONCURRENCY=2
+    MAX_WEBFLOW_BATCH_SIZE=25
+    MAX_WEBFLOW_CONCURRENCY=5
+
+  Backward-compatible env:
+    BATCH_SIZE and CONCURRENCY are still honored when phase-specific env values
+    are not set. Prefer GENERATE_* and WEBFLOW_* for clear production behavior.
 
   Optional research env:
     TITLE_RESEARCH_SERP_PROVIDER=auto | serpapi | dataforseo | bing
@@ -54,24 +70,42 @@ const JOB_ID = stringEnv("JOB_ID", "")
 const PHASE = stringEnv("PHASE", "generate").toLowerCase()
 const WORKER_ID = stringEnv("WORKER_ID", `render-${PHASE}-worker`)
 
-const MAX_GENERATE_BATCH_SIZE = numberEnv("MAX_GENERATE_BATCH_SIZE", 250, 1, 1000)
-const MAX_GENERATE_CONCURRENCY = numberEnv("MAX_GENERATE_CONCURRENCY", 100, 1, 1000)
+const MAX_GENERATE_BATCH_SIZE = numberEnv("MAX_GENERATE_BATCH_SIZE", 25, 1, 1000)
+const MAX_GENERATE_CONCURRENCY = numberEnv("MAX_GENERATE_CONCURRENCY", 25, 1, 1000)
 const MAX_WEBFLOW_BATCH_SIZE = numberEnv("MAX_WEBFLOW_BATCH_SIZE", 25, 1, 100)
 const MAX_WEBFLOW_CONCURRENCY = numberEnv("MAX_WEBFLOW_CONCURRENCY", 5, 1, 25)
 
-const BATCH_SIZE = numberEnv(
+const GENERATE_BATCH_SIZE = phaseNumberEnv(
+  "GENERATE_BATCH_SIZE",
   "BATCH_SIZE",
-  PHASE === "webflow" ? 5 : 1,
+  25,
   1,
-  PHASE === "webflow" ? MAX_WEBFLOW_BATCH_SIZE : MAX_GENERATE_BATCH_SIZE
+  MAX_GENERATE_BATCH_SIZE
+)
+const GENERATE_CONCURRENCY = phaseNumberEnv(
+  "GENERATE_CONCURRENCY",
+  "CONCURRENCY",
+  25,
+  1,
+  MAX_GENERATE_CONCURRENCY
+)
+const WEBFLOW_BATCH_SIZE = phaseNumberEnv(
+  "WEBFLOW_BATCH_SIZE",
+  "BATCH_SIZE",
+  5,
+  1,
+  MAX_WEBFLOW_BATCH_SIZE
+)
+const WEBFLOW_CONCURRENCY = phaseNumberEnv(
+  "WEBFLOW_CONCURRENCY",
+  "CONCURRENCY",
+  2,
+  1,
+  MAX_WEBFLOW_CONCURRENCY
 )
 
-const CONCURRENCY = numberEnv(
-  "CONCURRENCY",
-  1,
-  1,
-  PHASE === "webflow" ? MAX_WEBFLOW_CONCURRENCY : MAX_GENERATE_CONCURRENCY
-)
+const BATCH_SIZE = PHASE === "webflow" ? WEBFLOW_BATCH_SIZE : GENERATE_BATCH_SIZE
+const CONCURRENCY = PHASE === "webflow" ? WEBFLOW_CONCURRENCY : GENERATE_CONCURRENCY
 const RESET_STALE_MINUTES = numberEnv("RESET_STALE_MINUTES", 45, 0, 1440)
 
 const SLEEP_MS = numberEnv("SLEEP_MS", 5000, 250, 300000)
@@ -140,6 +174,12 @@ function numberEnv(name, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) {
   const value = Number(process.env[name])
   if (!Number.isFinite(value)) return fallback
   return Math.max(min, Math.min(max, Math.floor(value)))
+}
+
+function phaseNumberEnv(primaryName, legacyName, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) {
+  if (envValue(primaryName)) return numberEnv(primaryName, fallback, min, max)
+  if (envValue(legacyName)) return numberEnv(legacyName, fallback, min, max)
+  return numberEnv(primaryName, fallback, min, max)
 }
 
 function boolEnv(name, fallback) {
@@ -527,6 +567,10 @@ function buildEdgeRequestBody(action, extra = {}) {
     workerId: WORKER_ID,
     workerBatchSize: BATCH_SIZE,
     workerConcurrency: CONCURRENCY,
+    generateBatchSize: GENERATE_BATCH_SIZE,
+    generateConcurrency: GENERATE_CONCURRENCY,
+    webflowBatchSize: WEBFLOW_BATCH_SIZE,
+    webflowConcurrency: WEBFLOW_CONCURRENCY,
     resetStaleMinutes: RESET_STALE_MINUTES,
     includeRows: false,
     includeTitles: false,
@@ -1263,7 +1307,18 @@ async function generateTitlesForRow(job, row) {
 
 async function processGenerationRow(claimData, row) {
   const rowId = String(row.id || "")
+  const rowIndex = row.rowIndex ?? row.row_index
   const job = claimData.job || {}
+  const startedAt = Date.now()
+
+  logJson({
+    event: "generation_row_started",
+    phase: "generate",
+    workerId: WORKER_ID,
+    jobId: claimData.jobId || job.jobId || job.id || null,
+    rowId,
+    rowIndex,
+  })
 
   try {
     const generated = await generateTitlesForRow(job, row)
@@ -1282,9 +1337,22 @@ async function processGenerationRow(claimData, row) {
       message: `Generated ${generated.titles.length} title(s) by Render worker.`,
     })
 
+    logJson({
+      event: "generation_row_completed",
+      phase: "generate",
+      workerId: WORKER_ID,
+      jobId: claimData.jobId || job.jobId || job.id || null,
+      rowId,
+      rowIndex,
+      durationMs: Date.now() - startedAt,
+      generatedTitleCount: generated.titles.length,
+      serpProvider: generated.research?.serpProvider,
+      researchMode: generated.research?.researchMode,
+    })
+
     return {
       rowId,
-      rowIndex: row.rowIndex ?? row.row_index,
+      rowIndex,
       success: true,
       generatedTitleCount: generated.titles.length,
       serpProvider: generated.research?.serpProvider,
@@ -1297,9 +1365,20 @@ async function processGenerationRow(claimData, row) {
       rowId,
       error: message,
     })
+    logJson({
+      event: "generation_row_failed",
+      phase: "generate",
+      workerId: WORKER_ID,
+      jobId: claimData.jobId || job.jobId || job.id || null,
+      rowId,
+      rowIndex,
+      durationMs: Date.now() - startedAt,
+      error: message,
+    })
+
     return {
       rowId,
-      rowIndex: row.rowIndex ?? row.row_index,
+      rowIndex,
       success: false,
       error: message,
     }
@@ -1467,7 +1546,8 @@ async function getQueueStatus(phase, jobId = "") {
 
 async function runGenerateLoopOnce() {
   const claimData = await callEdge("claim_generation_rows", {
-    workerBatchSize: BATCH_SIZE,
+    workerBatchSize: GENERATE_BATCH_SIZE,
+    workerConcurrency: GENERATE_CONCURRENCY,
     resetStaleMinutes: RESET_STALE_MINUTES,
   })
 
@@ -1483,13 +1563,29 @@ async function runGenerateLoopOnce() {
     return { worked: false, done: generationDone(stats), data: status }
   }
 
-  const results = await processWithConcurrency(claimData.rows, CONCURRENCY, (row) => processGenerationRow(claimData, row))
+  const activeConcurrency = Math.min(GENERATE_CONCURRENCY, claimData.rows.length)
+
+  logJson({
+    event: "generation_batch_processing_started",
+    phase: "generate",
+    workerId: WORKER_ID,
+    jobId: claimData.jobId,
+    claimedRows: claimData.rows.length,
+    configuredBatchSize: GENERATE_BATCH_SIZE,
+    configuredConcurrency: GENERATE_CONCURRENCY,
+    activeConcurrency,
+  })
+
+  const results = await processWithConcurrency(claimData.rows, GENERATE_CONCURRENCY, (row) => processGenerationRow(claimData, row))
 
   logJson({
     event: "generation_rows_processed",
     phase: "generate",
     workerId: WORKER_ID,
     jobId: claimData.jobId,
+    configuredBatchSize: GENERATE_BATCH_SIZE,
+    configuredConcurrency: GENERATE_CONCURRENCY,
+    activeConcurrency,
     processedCount: results.length,
     successCount: results.filter((result) => result?.success).length,
     errorCount: results.filter((result) => !result?.success).length,
@@ -1508,7 +1604,8 @@ async function runGenerateLoopOnce() {
 
 async function runWebflowLoopOnce() {
   const claimData = await callEdge("claim_webflow_titles", {
-    workerBatchSize: BATCH_SIZE,
+    workerBatchSize: WEBFLOW_BATCH_SIZE,
+    workerConcurrency: WEBFLOW_CONCURRENCY,
     resetStaleMinutes: RESET_STALE_MINUTES,
   })
 
@@ -1524,13 +1621,29 @@ async function runWebflowLoopOnce() {
     return { worked: false, done: webflowDone(stats), data: status }
   }
 
-  const results = await processWithConcurrency(claimData.titles, CONCURRENCY, (title) => processWebflowTitle(claimData, title))
+  const activeConcurrency = Math.min(WEBFLOW_CONCURRENCY, claimData.titles.length)
+
+  logJson({
+    event: "webflow_batch_processing_started",
+    phase: "webflow",
+    workerId: WORKER_ID,
+    jobId: claimData.jobId,
+    claimedTitles: claimData.titles.length,
+    configuredBatchSize: WEBFLOW_BATCH_SIZE,
+    configuredConcurrency: WEBFLOW_CONCURRENCY,
+    activeConcurrency,
+  })
+
+  const results = await processWithConcurrency(claimData.titles, WEBFLOW_CONCURRENCY, (title) => processWebflowTitle(claimData, title))
 
   logJson({
     event: "webflow_titles_processed",
     phase: "webflow",
     workerId: WORKER_ID,
     jobId: claimData.jobId,
+    configuredBatchSize: WEBFLOW_BATCH_SIZE,
+    configuredConcurrency: WEBFLOW_CONCURRENCY,
+    activeConcurrency,
     processedCount: results.length,
     successCount: results.filter((result) => result?.success).length,
     errorCount: results.filter((result) => !result?.success).length,
@@ -1570,8 +1683,12 @@ async function main() {
     workerId: WORKER_ID,
     configuredJobId: JOB_ID || null,
     autoDiscoveryEnabled: !JOB_ID,
-    batchSize: BATCH_SIZE,
-    concurrency: CONCURRENCY,
+    activeBatchSizeForCurrentPhase: BATCH_SIZE,
+    activeConcurrencyForCurrentPhase: CONCURRENCY,
+    generateBatchSize: GENERATE_BATCH_SIZE,
+    generateConcurrency: GENERATE_CONCURRENCY,
+    webflowBatchSize: WEBFLOW_BATCH_SIZE,
+    webflowConcurrency: WEBFLOW_CONCURRENCY,
     maxGenerateBatchSize: MAX_GENERATE_BATCH_SIZE,
     maxGenerateConcurrency: MAX_GENERATE_CONCURRENCY,
     maxWebflowBatchSize: MAX_WEBFLOW_BATCH_SIZE,
